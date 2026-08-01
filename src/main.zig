@@ -2,16 +2,13 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const assert = std.debug.assert;
-const io = std.io;
+const Io = std.Io;
+const Dir = std.Io.Dir;
 const fs = std.fs;
 const mem = std.mem;
 const process = std.process;
 const Allocator = mem.Allocator;
-const ArrayListUnmanaged = std.ArrayListUnmanaged;
 const Color = std.zig.Color;
-const ThreadPool = std.Thread.Pool;
-const cleanExit = std.process.cleanExit;
-const native_os = builtin.os.tag;
 const Cache = std.Build.Cache;
 const Directory = std.Build.Cache.Directory;
 const EnvVar = std.zig.EnvVar;
@@ -40,10 +37,10 @@ const Verbosity = enum {
 };
 
 const global = struct {
-    var gpa_instance: std.heap.GeneralPurposeAllocator(.{}) = .{};
-    const gpa = gpa_instance.allocator();
-    var arena_instance = std.heap.ArenaAllocator.init(gpa);
-    const arena = arena_instance.allocator();
+    var gpa: Allocator = undefined;
+    var arena: Allocator = undefined;
+    var io: Io = undefined;
+    var environ_map: *const std.process.Environ.Map = undefined;
 
     var cached_verbosity: ?Verbosity = null;
     var cached_app_data_dir: ?union(enum) {
@@ -53,7 +50,7 @@ const global = struct {
 
     fn getAppDataDir() ![]const u8 {
         if (cached_app_data_dir == null) {
-            cached_app_data_dir = if (std.fs.getAppDataDir(arena, "anyzig")) |dir|
+            cached_app_data_dir = if (resolveAppDataDir(arena, environ_map)) |dir|
                 .{ .ok = dir }
             else |e|
                 .{ .err = e };
@@ -67,11 +64,53 @@ const global = struct {
     var root_progress_node: ?std.Progress.Node = null;
     fn getRootProgressNode() std.Progress.Node {
         if (root_progress_node == null) {
-            root_progress_node = std.Progress.start(.{ .root_name = "anyzig" });
+            root_progress_node = std.Progress.start(io, .{ .root_name = "anyzig" });
         }
         return root_progress_node.?;
     }
 };
+/// Returns the app data dir for the current OS
+fn resolveAppDataDir(
+    arena: Allocator,
+    environ_map: *const std.process.Environ.Map,
+) ![]const u8 {
+    const app_name = "anyzig";
+    // todo: make this overwritable using an env var
+    switch (builtin.os.tag) {
+        .windows => {
+            const local_app_data = environ_map.get("LOCALAPPDATA") orelse
+                return error.AppDataDirUnavailable;
+            return fs.path.join(arena, &.{ local_app_data, app_name });
+        },
+        .macos => {
+            const home = environ_map.get("HOME") orelse return error.AppDataDirUnavailable;
+            return fs.path.join(arena, &.{ home, "Library", "Application Support", app_name });
+        },
+        else => {
+            if (environ_map.get("XDG_DATA_HOME")) |data_home| {
+                if (data_home.len > 0) return fs.path.join(arena, &.{ data_home, app_name });
+            }
+            const home = environ_map.get("HOME") orelse return error.AppDataDirUnavailable;
+            return fs.path.join(arena, &.{ home, ".local", "share", app_name });
+        },
+    }
+}
+
+/// Takes the stderr lock so output cannot be interleaved with the progress display.
+fn stderrPrint(comptime format: []const u8, args: anytype) void {
+    var buffer: [1024]u8 = undefined;
+    const stderr = std.debug.lockStderr(&buffer);
+    defer std.debug.unlockStderr();
+    stderr.file_writer.interface.print(format, args) catch return;
+    stderr.file_writer.interface.flush() catch return;
+}
+
+fn stdoutPrint(comptime format: []const u8, args: anytype) !void {
+    var buffer: [1024]u8 = undefined;
+    var file_writer = Io.File.stdout().writerStreaming(global.io, &buffer);
+    try file_writer.interface.print(format, args);
+    try file_writer.interface.flush();
+}
 
 fn readVerbosityFile() union(enum) {
     no_app_data_dir,
@@ -81,19 +120,17 @@ fn readVerbosityFile() union(enum) {
     const app_data_dir = global.getAppDataDir() catch return .no_app_data_dir;
     const verbosity_path = std.fs.path.join(global.arena, &.{ app_data_dir, "verbosity" }) catch |e| oom(e);
     defer global.arena.free(verbosity_path);
-    const content = read_file: {
-        const file = std.fs.cwd().openFile(verbosity_path, .{}) catch |err| switch (err) {
-            error.FileNotFound => return .no_file,
-            else => |e| std.debug.panic("open '{s}' failed with {s}", .{ verbosity_path, @errorName(e) }),
-        };
-        defer file.close();
-        break :read_file file.readToEndAlloc(global.arena, std.math.maxInt(usize)) catch |err| std.debug.panic(
-            "read '{s}' failed with {s}",
-            .{ verbosity_path, @errorName(err) },
-        );
+    const content = Dir.cwd().readFileAlloc(
+        global.io,
+        verbosity_path,
+        global.arena,
+        .unlimited,
+    ) catch |err| switch (err) {
+        error.FileNotFound => return .no_file,
+        else => |e| std.debug.panic("read '{s}' failed with {s}", .{ verbosity_path, @errorName(e) }),
     };
     defer global.arena.free(content);
-    const content_trimmed = std.mem.trimRight(u8, content, &std.ascii.whitespace);
+    const content_trimmed = std.mem.trimEnd(u8, content, &std.ascii.whitespace);
     if (std.mem.eql(u8, content_trimmed, "debug")) return .{ .loaded_from_file = .debug };
     if (std.mem.eql(u8, content_trimmed, "warn")) return .{ .loaded_from_file = .warn };
     std.debug.panic(
@@ -106,7 +143,7 @@ fn readVerbosityFile() union(enum) {
 
 fn anyzigLog(
     comptime level: std.log.Level,
-    comptime scope: @Type(.enum_literal),
+    comptime scope: @EnumLiteral(),
     comptime format: []const u8,
     args: anytype,
 ) void {
@@ -136,16 +173,7 @@ fn anyzigLog(
         }
     }
 
-    const stderr = std.io.getStdErr().writer();
-    var bw = std.io.bufferedWriter(stderr);
-    const writer = bw.writer();
-
-    std.debug.lockStdErr();
-    defer std.debug.unlockStdErr();
-    nosuspend {
-        writer.print("anyzig" ++ scope_level ++ ": " ++ format ++ "\n", args) catch return;
-        bw.flush() catch return;
-    }
+    stderrPrint("anyzig" ++ scope_level ++ ": " ++ format ++ "\n", args);
 }
 
 const Extent = struct { start: usize, limit: usize };
@@ -225,12 +253,15 @@ fn skipWhitespaceAndComments(s: []const u8, start: usize) usize {
 }
 
 fn loadBuildZigZon(arena: Allocator, build_root: BuildRoot) !?[]const u8 {
-    const zon = build_root.directory.handle.openFile("build.zig.zon", .{}) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => |e| return e,
+    return build_root.directory.handle.readFileAlloc(
+        global.io,
+        "build.zig.zon",
+        arena,
+        .unlimited,
+    ) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => |e| e,
     };
-    defer zon.close();
-    return try zon.readToEndAlloc(arena, std.math.maxInt(usize));
 }
 
 fn isMachVersion(v: SemanticVersion) bool {
@@ -263,11 +294,11 @@ fn determineSemanticVersion(scratch: Allocator, build_root: BuildRoot) !Semantic
         }
 
         log.info(
-            "{s} '{s}' pulled from '{}build.zig.zon'",
+            "{s} '{s}' pulled from '{f}build.zig.zon'",
             .{ key_version, version, build_root.directory },
         );
         return SemanticVersion.parse(version) orelse errExit(
-            "{}build.zig.zon has invalid {s} \"{s}\"",
+            "{f}build.zig.zon has invalid {s} \"{s}\"",
             .{ build_root.directory, key_version, version },
         );
     }
@@ -289,18 +320,21 @@ fn determineSemanticVersion(scratch: Allocator, build_root: BuildRoot) !Semantic
     // return "0.13.0";
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
+    global.gpa = init.gpa;
+    global.arena = init.arena.allocator();
+    global.io = init.io;
+    global.environ_map = init.environ_map;
+
     defer if (global.root_progress_node) |n| {
         n.end();
     };
 
-    defer _ = global.gpa_instance.deinit();
     const gpa = global.gpa;
-
-    defer global.arena_instance.deinit();
     const arena = global.arena;
+    const io = global.io;
 
-    const cmdline: Cmdline = try .alloc(arena);
+    const cmdline: Cmdline = try .alloc(init.minimal.args, arena);
     defer cmdline.free(arena);
 
     const cmdline_offset: usize, const manual_version: ?VersionSpecifier = blk: {
@@ -339,10 +373,7 @@ pub fn main() !void {
     const version_specifier: VersionSpecifier, const is_init = blk: {
         if (maybe_command) |command| {
             if (std.mem.startsWith(u8, command, "-") and !std.mem.eql(u8, command, "-h") and !std.mem.eql(u8, command, "--help")) {
-                try std.io.getStdErr().writer().print(
-                    "error: expected a command but got '{s}'\n",
-                    .{command},
-                );
+                stderrPrint("error: expected a command but got '{s}'\n", .{command});
                 std.process.exit(0xff);
             }
             if (build_options.exe == .zig and (std.mem.eql(u8, command, "init") or std.mem.eql(u8, command, "init-exe") or std.mem.eql(u8, command, "init-lib"))) {
@@ -356,7 +387,7 @@ pub fn main() !void {
                 };
 
                 if (manual_version) |version| break :blk .{ version, !is_help };
-                try std.io.getStdErr().writer().print(
+                stderrPrint(
                     "error: anyzig init requires a version, i.e. 'zig 0.13.0 {s}'\n",
                     .{command},
                 );
@@ -366,17 +397,18 @@ pub fn main() !void {
         }
         if (manual_version) |version| break :blk .{ version, false };
         const build_root = try findBuildRoot(arena, build_root_options) orelse {
-            try std.io.getStdErr().writeAll(
+            stderrPrint(
                 "no build.zig to pull a zig version from, you can:\n" ++
                     "  1. run '" ++ exe_str ++ " VERSION' to specify a version\n" ++
                     "  2. run from a directory where a build.zig can be found\n",
+                .{},
             );
             std.process.exit(0xff);
         };
         break :blk .{ .{ .semantic = try determineSemanticVersion(arena, build_root) }, false };
     };
 
-    const app_data_path = try std.fs.getAppDataDir(arena, "anyzig");
+    const app_data_path = try resolveAppDataDir(arena, global.environ_map);
     defer arena.free(app_data_path);
     log.info("appdata '{s}'", .{app_data_path});
 
@@ -386,45 +418,42 @@ pub fn main() !void {
             const download_index_kind: DownloadIndexKind = .official;
             const index_path = try std.fs.path.join(arena, &.{ app_data_path, download_index_kind.basename() });
             defer arena.free(index_path);
-            try fetchFile(arena, download_index_kind.url(), download_index_kind.uri(), index_path);
-            const index_content = blk: {
-                // since we just downloaded the file, this should always succeed now
-                const file = try std.fs.cwd().openFile(index_path, .{});
-                defer file.close();
-                break :blk try file.readToEndAlloc(arena, std.math.maxInt(usize));
-            };
+            try fetchFile(arena, download_index_kind.uri(), index_path);
+            // since we just downloaded the file, this should always succeed now
+            const index_content = try Dir.cwd().readFileAlloc(io, index_path, arena, .unlimited);
             defer arena.free(index_content);
             break :semantic_version extractMasterVersion(arena, index_path, index_content);
         },
     };
     if (version_specifier == .master) {
-        std.log.info("master is at {}", .{semantic_version});
+        std.log.info("master is at {f}", .{semantic_version});
     }
 
     const hashstore_path = try std.fs.path.join(arena, &.{ app_data_path, "hashstore" });
     // no need to free
-    try hashstore.init(hashstore_path);
+    try hashstore.init(io, hashstore_path);
 
-    const hashstore_name = std.fmt.allocPrint(arena, exe_str ++ "-{}", .{semantic_version}) catch |e| oom(e);
+    const hashstore_name = std.fmt.allocPrint(arena, exe_str ++ "-{f}", .{semantic_version}) catch |e| oom(e);
     // no need to free
 
-    const maybe_hash = maybeHashAndPath(try hashstore.find(hashstore_path, hashstore_name));
+    const maybe_hash = maybeHashAndPath(try hashstore.find(io, hashstore_path, hashstore_name));
 
-    const override_global_cache_dir: ?[]const u8 = try EnvVar.ZIG_GLOBAL_CACHE_DIR.get(arena);
+    const override_global_cache_dir: ?[]const u8 = EnvVar.ZIG_GLOBAL_CACHE_DIR.get(global.environ_map);
     var global_cache_directory: Directory = l: {
-        const p = override_global_cache_dir orelse try introspect.resolveGlobalCacheDir(arena);
+        const p = override_global_cache_dir orelse
+            try introspect.resolveGlobalCacheDir(arena, global.environ_map);
         break :l .{
-            .handle = try fs.cwd().makeOpenPath(p, .{}),
+            .handle = try Dir.cwd().createDirPathOpen(io, p, .{}),
             .path = p,
         };
     };
-    defer global_cache_directory.handle.close();
+    defer global_cache_directory.handle.close(io);
 
     const hash = blk: {
         if (maybe_hash) |hash| {
-            if (global_cache_directory.handle.access(hash.path(), .{})) |_| {
+            if (global_cache_directory.handle.access(io, hash.path(), .{})) |_| {
                 log.info(
-                    "{s} '{}' already exists at '{}{s}'",
+                    "{s} '{f}' already exists at '{f}{s}'",
                     .{ @tagName(build_options.exe), semantic_version, global_cache_directory, hash.path() },
                 );
                 break :blk hash;
@@ -443,7 +472,7 @@ pub fn main() !void {
             url.fetch,
             .{ .debug_hash = false },
         ));
-        log.info("downloaded {s} to '{}{s}'", .{ hashstore_name, global_cache_directory, hash.path() });
+        log.info("downloaded {s} to '{f}{s}'", .{ hashstore_name, global_cache_directory, hash.path() });
         if (maybe_hash) |*previous_hash| {
             if (previous_hash.val.eql(&hash.val)) {
                 log.info("{s} was already in the hashstore as {s}", .{ hashstore_name, hash.val.toSlice() });
@@ -452,11 +481,11 @@ pub fn main() !void {
                     "{s} hash has changed!\nold:{s}\nnew:{s}\n",
                     .{ hashstore_name, previous_hash.val.toSlice(), hash.val.toSlice() },
                 );
-                try hashstore.delete(hashstore_path, hashstore_name);
-                try hashstore.save(hashstore_path, hashstore_name, hash.val.toSlice());
+                try hashstore.delete(io, hashstore_path, hashstore_name);
+                try hashstore.save(io, hashstore_path, hashstore_name, hash.val.toSlice());
             }
         } else {
-            try hashstore.save(hashstore_path, hashstore_name, hash.val.toSlice());
+            try hashstore.save(io, hashstore_path, hashstore_name, hash.val.toSlice());
         }
         break :blk hash;
     };
@@ -470,46 +499,47 @@ pub fn main() !void {
         // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
         // TODO: if on windows, create a job so our child process gets killed if
         //       our process gets killed
-        var al: ArrayListUnmanaged([]const u8) = .{};
+        var al: std.ArrayListUnmanaged([]const u8) = .empty;
         try al.append(arena, versioned_exe);
         for (cmdline_offset..cmdline.len()) |arg_index| {
             try al.append(arena, cmdline.arg(arg_index));
         }
-        var child: std.process.Child = .init(al.items, arena);
-        try child.spawn();
-        const result = try child.wait();
+        var child = try std.process.spawn(io, .{ .argv = al.items });
+        const result = try child.wait(io);
         switch (result) {
-            .Exited => |code| if (code != 0) std.process.exit(0xff),
+            .exited => |code| if (code != 0) std.process.exit(0xff),
             else => std.process.exit(0xff),
         }
     }
 
     if (is_init) {
         const build_root = try findBuildRoot(arena, build_root_options) orelse @panic("init did not create a build.zig file");
-        log.info("{}{s}", .{ build_root.directory, build_root.build_zig_basename });
+        log.info("{f}{s}", .{ build_root.directory, build_root.build_zig_basename });
         const zon = try loadBuildZigZon(arena, build_root) orelse {
-            const f = try std.fs.cwd().createFile("build.zig.zon", .{});
-            defer f.close();
             // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
             // TODO: maybe don't use .name = placeholder?
-            try f.writer().print(
+            const content = try std.fmt.allocPrint(arena,
                 \\.{{
                 \\    .name = "placeholder",
                 \\    .version = "0.0.0",
-                \\    .minimum_zig_version = "{}",
+                \\    .minimum_zig_version = "{f}",
                 \\}}
                 \\
             , .{semantic_version});
+            defer arena.free(content);
+            try Dir.cwd().writeFile(io, .{ .sub_path = "build.zig.zon", .data = content });
             return;
         };
         const version_extent = extractZigVersion(zon, key_minimum_zig_version) orelse {
             if (!std.mem.startsWith(u8, zon, ".{")) @panic("zon file did not start with '.{'");
             if (zon.len < 2 or zon[2] != '\n') @panic("zon file not start with '.{\\n");
-            const f = try std.fs.cwd().createFile("build.zig.zon", .{});
-            defer f.close();
-            try f.writer().writeAll(zon[0..3]);
-            try f.writer().print("    .minimum_zig_version = \"{}\",\n", .{semantic_version});
-            try f.writer().writeAll(zon[3..]);
+            const content = try std.fmt.allocPrint(
+                arena,
+                "{s}    .minimum_zig_version = \"{f}\",\n{s}",
+                .{ zon[0..3], semantic_version, zon[3..] },
+            );
+            defer arena.free(content);
+            try Dir.cwd().writeFile(io, .{ .sub_path = "build.zig.zon", .data = content });
             return;
         };
 
@@ -521,28 +551,25 @@ pub fn main() !void {
         if (generated_version.eql(semantic_version))
             return;
         std.debug.panic(
-            "zig init generated version '{}' but expected '{}'",
+            "zig init generated version '{f}' but expected '{f}'",
             .{ generated_version, semantic_version },
         );
     }
 
     if (!stay_alive) {
-        const argv = blk: {
-            var al: ArrayListUnmanaged(?[*:0]const u8) = .{};
-            try al.append(arena, versioned_exe);
-            for (std.os.argv[cmdline_offset..]) |arg| {
-                try al.append(arena, arg);
-            }
-            break :blk try al.toOwnedSliceSentinel(arena, null);
-        };
-        const err = std.posix.execveZ(versioned_exe, argv, @ptrCast(std.os.environ.ptr));
+        var al: std.ArrayListUnmanaged([]const u8) = .empty;
+        try al.append(arena, versioned_exe);
+        for (cmdline_offset..cmdline.len()) |arg_index| {
+            try al.append(arena, cmdline.arg(arg_index));
+        }
+        const err = std.process.replace(io, .{ .argv = al.items });
         log.err("exec '{s}' failed with {s}", .{ versioned_exe, @errorName(err) });
         process.exit(0xff);
     }
 }
 
 fn anyCommandUsage() !u8 {
-    try std.io.getStdErr().writer().print(
+    stderrPrint(
         "any" ++ @tagName(build_options.exe) ++ " {s} from https://github.com/marler8997/anyzig\n" ++
             "Here are the anyzig-specific subcommands:\n" ++
             "  zig any set-verbosity LEVEL    | sets the default system-wide verbosity\n" ++
@@ -563,7 +590,7 @@ fn anyCommand(cmdline: Cmdline, cmdline_offset: usize) !u8 {
 
     if (std.mem.eql(u8, command, "version")) {
         if (arg_offset < cmdline.len()) errExit("the 'version' subcommand does not take any cmdline args", .{});
-        try std.io.getStdOut().writer().print("{s}\n", .{@embedFile("version")});
+        try stdoutPrint("{s}\n", .{@embedFile("version")});
         return 0;
     } else if (std.mem.eql(u8, command, "set-verbosity")) {
         if (arg_offset >= cmdline.len()) errExit("missing VERBOSITY (either 'warn' or 'debug')", .{});
@@ -582,11 +609,14 @@ fn anyCommand(cmdline: Cmdline, cmdline_offset: usize) !u8 {
             ) catch |e| oom(e);
             defer global.arena.free(verbosity_path);
             if (std.fs.path.dirname(verbosity_path)) |dir| {
-                try std.fs.cwd().makePath(dir);
+                try Dir.cwd().createDirPath(global.io, dir);
             }
-            const file = try std.fs.cwd().createFile(verbosity_path, .{});
-            defer file.close();
-            try file.writer().print("{s}\n", .{level_str});
+            const content = try std.fmt.allocPrint(global.arena, "{s}\n", .{level_str});
+            defer global.arena.free(content);
+            try Dir.cwd().writeFile(global.io, .{
+                .sub_path = verbosity_path,
+                .data = content,
+            });
         }
         switch (readVerbosityFile()) {
             .no_app_data_dir => @panic("no app data dir?"),
@@ -602,26 +632,28 @@ fn anyCommand(cmdline: Cmdline, cmdline_offset: usize) !u8 {
 }
 
 fn listInstalled() !void {
+    const io = global.io;
     const app_data_dir = try global.getAppDataDir();
 
     const hashstore_path = try std.fs.path.join(global.arena, &.{ app_data_dir, "hashstore" });
     // no need to free
-    try hashstore.init(hashstore_path);
-    const reverse_lookup = try hashstore.allocReverseLookup(hashstore_path, global.arena);
+    try hashstore.init(io, hashstore_path);
+    const reverse_lookup = try hashstore.allocReverseLookup(io, hashstore_path, global.arena);
 
-    const override_global_cache_dir: ?[]const u8 = try EnvVar.ZIG_GLOBAL_CACHE_DIR.get(global.arena);
-    const global_cache_dir_path = override_global_cache_dir orelse try introspect.resolveGlobalCacheDir(global.arena);
+    const override_global_cache_dir: ?[]const u8 = EnvVar.ZIG_GLOBAL_CACHE_DIR.get(global.environ_map);
+    const global_cache_dir_path = override_global_cache_dir orelse
+        try introspect.resolveGlobalCacheDir(global.arena, global.environ_map);
     const p_path = std.fs.path.join(global.arena, &.{ global_cache_dir_path, "p" }) catch |e| oom(e);
     defer global.arena.free(p_path);
 
     var p_dir: Directory = .{
-        .handle = try fs.cwd().makeOpenPath(p_path, .{ .iterate = true }),
+        .handle = try Dir.cwd().createDirPathOpen(io, p_path, .{ .open_options = .{ .iterate = true } }),
         .path = p_path,
     };
-    defer p_dir.handle.close();
+    defer p_dir.handle.close(io);
 
     var it = p_dir.handle.iterate();
-    while (try it.next()) |entry| {
+    while (try it.next(io)) |entry| {
         if (entry.kind != .directory) continue;
         if (entry.name.len > zig.Package.Hash.max_len) continue;
 
@@ -642,26 +674,35 @@ fn listInstalled() !void {
             entry.name,
             comptime exe_str ++ builtin.target.exeFileExt(),
         });
-        std.fs.cwd().access(exe_path, .{}) catch |err| switch (err) {
+        Dir.cwd().access(io, exe_path, .{}) catch |err| switch (err) {
             error.FileNotFound => continue,
             else => |e| return e,
         };
-        var child = std.process.Child.init(&.{ exe_path, "version" }, global.arena);
-        child.stdout_behavior = .Pipe;
-        child.spawn() catch continue; // probably not a valid zig
+        // probably not a valid zig
+        var child = std.process.spawn(io, .{
+            .argv = &.{ exe_path, "version" },
+            .stdout = .pipe,
+        }) catch continue;
 
-        const child_stdout = try child.stdout.?.reader().readAllAlloc(global.arena, 100);
+        const child_stdout = blk: {
+            var buffer: [100]u8 = undefined;
+            var child_reader = child.stdout.?.readerStreaming(io, &buffer);
+            break :blk child_reader.interface.allocRemaining(global.arena, .limited(100)) catch {
+                _ = child.wait(io) catch {};
+                continue;
+            };
+        };
         defer global.arena.free(child_stdout);
-        const result = try child.wait();
-        if (result != .Exited or result.Exited != 0) {
+        const result = try child.wait(io);
+        if (result != .exited or result.exited != 0) {
             // must not be a zig
             continue;
         }
-        const version_str = std.mem.trimRight(u8, child_stdout, "\r\n");
+        const version_str = std.mem.trimEnd(u8, child_stdout, "\r\n");
         const semantic_version = SemanticVersion.parse(version_str) orelse continue;
-        const hashstore_name = std.fmt.allocPrint(global.arena, exe_str ++ "-{}", .{semantic_version}) catch |e| oom(e);
+        const hashstore_name = std.fmt.allocPrint(global.arena, exe_str ++ "-{f}", .{semantic_version}) catch |e| oom(e);
         defer global.arena.free(hashstore_name);
-        const maybe_hash = maybeHashAndPath(try hashstore.find(hashstore_path, hashstore_name));
+        const maybe_hash = maybeHashAndPath(try hashstore.find(io, hashstore_path, hashstore_name));
         if (maybe_hash) |*anyzig_store_hash| {
             if (!anyzig_store_hash.val.eql(&hash_from_cache)) {
                 log.err(
@@ -675,33 +716,46 @@ fn listInstalled() !void {
         } else {
             // TODO: should we just trust the hash is good?
             log.info("new hash added to anyzig store: {s}", .{entry.name});
-            try hashstore.save(hashstore_path, hashstore_name, entry.name);
+            try hashstore.save(io, hashstore_path, hashstore_name, entry.name);
         }
         try listVersion(p_path, semantic_version, entry.name);
     }
 }
 
 fn listVersion(p_path: []const u8, version: SemanticVersion, hash: []const u8) !void {
-    const stdout = io.getStdOut().writer();
-    try stdout.print("{}\t{s}{s}{s}\n", .{ version, p_path, std.fs.path.sep_str, hash });
+    try stdoutPrint("{f}\t{s}{s}{s}\n", .{ version, p_path, std.fs.path.sep_str, hash });
 }
 
 pub const SemanticVersion = struct {
-    const max_pre = 50;
-    const max_build = 50;
-    const max_string = 50 + max_pre + max_build;
+    const max_component = 50;
+    const max_string = 50 + max_component + max_component;
+
+    const Component = struct {
+        buf: [max_component]u8,
+        len: usize,
+
+        fn init(what: []const u8, text: []const u8) Component {
+            if (text.len > max_component) std.debug.panic(
+                "semantic version {s} '{s}' is too long (max is {d})",
+                .{ what, text, max_component },
+            );
+            var result: Component = .{ .buf = undefined, .len = text.len };
+            @memcpy(result.buf[0..text.len], text);
+            return result;
+        }
+        fn slice(self: *const Component) []const u8 {
+            return self.buf[0..self.len];
+        }
+    };
 
     major: usize,
     minor: usize,
     patch: usize,
-    pre: ?std.BoundedArray(u8, max_pre),
-    build: ?std.BoundedArray(u8, max_build),
+    pre: ?Component,
+    build: ?Component,
 
-    pub fn array(self: *const SemanticVersion) std.BoundedArray(u8, max_string) {
-        var result: std.BoundedArray(u8, max_string) = undefined;
-        const roundtrip = std.fmt.bufPrint(&result.buffer, "{}", .{self}) catch unreachable;
-        result.len = roundtrip.len;
-        return result;
+    pub fn string(self: *const SemanticVersion, buffer: *[max_string]u8) []const u8 {
+        return std.fmt.bufPrint(buffer, "{f}", .{self}) catch unreachable;
     }
 
     pub fn parse(s: []const u8) ?SemanticVersion {
@@ -714,22 +768,17 @@ pub const SemanticVersion = struct {
             .major = parsed.major,
             .minor = parsed.minor,
             .patch = parsed.patch,
-            .pre = if (parsed.pre) |pre| std.BoundedArray(u8, max_pre).init(pre.len) catch |e| switch (e) {
-                error.Overflow => std.debug.panic("semantic version pre '{s}' is too long (max is {})", .{ pre, max_pre }),
-            } else null,
-            .build = if (parsed.build) |build| std.BoundedArray(u8, max_build).init(build.len) catch |e| switch (e) {
-                error.Overflow => std.debug.panic("semantic version build '{s}' is too long (max is {})", .{ build, max_build }),
-            } else null,
+            .pre = if (parsed.pre) |pre| .init("pre", pre) else null,
+            .build = if (parsed.build) |build| .init("build", build) else null,
         };
-        if (parsed.pre) |pre| @memcpy(result.pre.?.slice(), pre);
-        if (parsed.build) |build| @memcpy(result.build.?.slice(), build);
 
         {
             // sanity check, ensure format gives us the same string back we just parsed
-            const roundtrip = result.array();
-            if (!std.mem.eql(u8, roundtrip.slice(), s)) errExit(
+            var buffer: [max_string]u8 = undefined;
+            const roundtrip = result.string(&buffer);
+            if (!std.mem.eql(u8, roundtrip, s)) errExit(
                 "codebug parse/format version mismatch:\nparsed: '{s}'\nformat: '{s}'\n",
-                .{ s, roundtrip.slice() },
+                .{ s, roundtrip },
             );
         }
 
@@ -747,13 +796,8 @@ pub const SemanticVersion = struct {
     pub fn eql(self: SemanticVersion, other: SemanticVersion) bool {
         return self.ref().order(other.ref()) == .eq;
     }
-    pub fn format(
-        self: SemanticVersion,
-        comptime fmt: []const u8,
-        options: std.fmt.FormatOptions,
-        writer: anytype,
-    ) !void {
-        try self.ref().format(fmt, options, writer);
+    pub fn format(self: SemanticVersion, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        try self.ref().format(writer);
     }
 };
 
@@ -856,12 +900,12 @@ fn makeOfficialUrl(arena: Allocator, semantic_version: SemanticVersion) Download
     return switch (determineVersionKind(semantic_version)) {
         .dev => DownloadUrl.initOfficial(std.fmt.allocPrint(
             arena,
-            "https://ziglang.org/builds/zig-" ++ arch_os ++ "-{0}." ++ archive_ext,
+            "https://ziglang.org/builds/zig-" ++ arch_os ++ "-{0f}." ++ archive_ext,
             .{semantic_version},
         ) catch |e| oom(e)),
         .release => |release| DownloadUrl.initOfficial(std.fmt.allocPrint(
             arena,
-            "https://ziglang.org/download/{0}/zig-{1s}-{0}." ++ archive_ext,
+            "https://ziglang.org/download/{0f}/zig-{1s}-{0f}." ++ archive_ext,
             .{
                 semantic_version,
                 switch (release.order(arch_os_swap_release)) {
@@ -880,7 +924,7 @@ fn getVersionUrl(
 ) !DownloadUrl {
     if (build_options.exe == .zls) return DownloadUrl.initOfficial(std.fmt.allocPrint(
         arena,
-        "https://builds.zigtools.org/zls-{s}-{}.{s}",
+        "https://builds.zigtools.org/zls-{s}-{f}.{s}",
         .{ switch (determineVersionKind(semantic_version)) {
             .dev => arch_os,
             .release => |release| switch (release.order(arch_os_swap_release)) {
@@ -897,29 +941,26 @@ fn getVersionUrl(
     defer arena.free(index_path);
 
     try_existing_index: {
-        const index_content = blk: {
-            const file = std.fs.cwd().openFile(index_path, .{}) catch |err| switch (err) {
-                error.FileNotFound => break :try_existing_index,
-                else => |e| return e,
-            };
-            defer file.close();
-            break :blk try file.readToEndAlloc(arena, std.math.maxInt(usize));
+        const index_content = Dir.cwd().readFileAlloc(
+            global.io,
+            index_path,
+            arena,
+            .unlimited,
+        ) catch |err| switch (err) {
+            error.FileNotFound => break :try_existing_index,
+            else => |e| return e,
         };
         defer arena.free(index_content);
         if (extractUrlFromMachDownloadIndex(arena, semantic_version, index_path, index_content)) |url|
             return url;
     }
 
-    try fetchFile(arena, download_index_kind.url(), download_index_kind.uri(), index_path);
-    const index_content = blk: {
-        // since we just downloaded the file, this should always succeed now
-        const file = try std.fs.cwd().openFile(index_path, .{});
-        defer file.close();
-        break :blk try file.readToEndAlloc(arena, std.math.maxInt(usize));
-    };
+    try fetchFile(arena, download_index_kind.uri(), index_path);
+    // since we just downloaded the file, this should always succeed now
+    const index_content = try Dir.cwd().readFileAlloc(global.io, index_path, arena, .unlimited);
     defer arena.free(index_content);
     return extractUrlFromMachDownloadIndex(arena, semantic_version, index_path, index_content) orelse {
-        errExit("compiler version '{}' is missing from download index {s}", .{ semantic_version, index_path });
+        errExit("compiler version '{f}' is missing from download index {s}", .{ semantic_version, index_path });
     };
 }
 
@@ -961,8 +1002,8 @@ fn extractUrlFromMachDownloadIndex(
         .{ index_filepath, @errorName(e) },
     );
     defer root.deinit();
-    const version_array = semantic_version.array();
-    const version_str = version_array.slice();
+    var version_buffer: [SemanticVersion.max_string]u8 = undefined;
+    const version_str = semantic_version.string(&version_buffer);
     const version_obj = root.value.object.get(version_str) orelse return null;
     const arch_os_obj = version_obj.object.get(arch_os) orelse std.debug.panic(
         "compiler version '{s}' does not contain an entry for arch-os '{s}'",
@@ -982,12 +1023,13 @@ fn extractUrlFromMachDownloadIndex(
     };
 }
 
-const PathBuf = std.BoundedArray(u8, 2 + zig.Package.Hash.max_len);
 const HashAndPath = struct {
     val: zig.Package.Hash,
-    path_buf: PathBuf,
+    /// Holds "p" ++ sep ++ hash, inline so this stays trivially copyable.
+    path_buf: [2 + zig.Package.Hash.max_len]u8,
+    path_len: usize,
     pub fn path(self: *const HashAndPath) []const u8 {
-        return self.path_buf.slice();
+        return self.path_buf[0..self.path_len];
     }
 };
 fn maybeHashAndPath(maybe_hash: ?zig.Package.Hash) ?HashAndPath {
@@ -997,24 +1039,25 @@ fn hashAndPath(hash: zig.Package.Hash) HashAndPath {
     const hash_slice = hash.toSlice();
     var result: HashAndPath = .{
         .val = hash,
-        .path_buf = PathBuf.init(2 + hash_slice.len) catch unreachable,
+        .path_buf = undefined,
+        .path_len = 2 + hash_slice.len,
     };
-    result.path_buf.buffer[0] = 'p';
-    result.path_buf.buffer[1] = std.fs.path.sep;
-    @memcpy(result.path_buf.buffer[2..][0..hash_slice.len], hash_slice);
+    result.path_buf[0] = 'p';
+    result.path_buf[1] = std.fs.path.sep;
+    @memcpy(result.path_buf[2..][0..hash_slice.len], hash_slice);
     return result;
 }
 
 fn fetchFile(
     scratch: Allocator,
-    url_string: []const u8,
     uri: std.Uri,
     out_filepath: []const u8,
 ) !void {
-    log.info("fetch '{}' to '{s}'", .{ uri, out_filepath });
+    const io = global.io;
+    log.info("fetch '{f}' to '{s}'", .{ uri, out_filepath });
     const root = global.getRootProgressNode();
 
-    const progress_node_name = std.fmt.allocPrint(scratch, "fetch {s}", .{uri}) catch |e| oom(e);
+    const progress_node_name = std.fmt.allocPrint(scratch, "fetch {f}", .{uri}) catch |e| oom(e);
     defer scratch.free(progress_node_name);
     const node = root.start(progress_node_name, 1);
     defer node.end();
@@ -1023,102 +1066,55 @@ fn fetchFile(
     defer scratch.free(lock_filepath);
 
     // TODO: might be nice for the lock file to report progress as well?
-    var file_lock = try LockFile.lock(lock_filepath);
+    var file_lock = try LockFile.lock(io, lock_filepath);
     defer file_lock.unlock();
 
-    var client = std.http.Client{ .allocator = scratch };
+    var client: std.http.Client = .{ .allocator = scratch, .io = io };
     defer client.deinit();
-    client.initDefaultProxies(scratch) catch |err| std.debug.panic(
-        "fetch '{}': init proxy failed with {s}",
+    client.initDefaultProxies(scratch, global.environ_map) catch |err| std.debug.panic(
+        "fetch '{f}': init proxy failed with {s}",
         .{ uri, @errorName(err) },
-    );
-    var header_buffer: [4096]u8 = undefined;
-    var request = client.open(.GET, uri, .{
-        .server_header_buffer = &header_buffer,
-        .keep_alive = false,
-    }) catch |e| std.debug.panic(
-        "fetch '{}': connect failed with {s}",
-        .{ uri, @errorName(e) },
-    );
-    defer request.deinit();
-    request.send() catch |e| std.debug.panic(
-        "fetch '{}': send failed with {s}",
-        .{ uri, @errorName(e) },
-    );
-    request.wait() catch |e| std.debug.panic(
-        "fetch '{}': wait failed with {s}",
-        .{ uri, @errorName(e) },
-    );
-    if (request.response.status != .ok) return errExit(
-        "fetch '{}': HTTP response {} \"{?s}\"",
-        .{ uri, @intFromEnum(request.response.status), request.response.status.phrase() },
     );
 
     const out_filepath_tmp = std.mem.concat(scratch, u8, &.{ out_filepath, ".fetching" }) catch |e| oom(e);
     defer scratch.free(out_filepath_tmp);
 
-    const file = std.fs.cwd().createFile(out_filepath_tmp, .{}) catch |e| std.debug.panic(
+    const cwd: Dir = .cwd();
+    const file = cwd.createFile(io, out_filepath_tmp, .{}) catch |e| std.debug.panic(
         "create '{s}' failed with {s}",
         .{ out_filepath_tmp, @errorName(e) },
     );
     defer {
-        if (std.fs.cwd().deleteFile(out_filepath_tmp)) {
+        if (cwd.deleteFile(io, out_filepath_tmp)) {
             std.log.info("removed '{s}'", .{out_filepath_tmp});
         } else |err| switch (err) {
             error.FileNotFound => {},
             else => |e| std.log.err("remove '{s}' failed with {s}", .{ out_filepath_tmp, @errorName(e) }),
         }
-        file.close();
+        file.close(io);
     }
 
-    const maybe_content_length: ?u64 = blk: {
-        // content length doesn't seem to be working with the mach index?
-        // not sure if it's a problem with the mach server or Zig's HTTP client
-        if (request.response.content_length) |content_length| {
-            if (std.mem.eql(u8, url_string, DownloadIndexKind.mach.url())) {
-                std.log.warn("ignoring content length {} for mach index", .{content_length});
-                break :blk null;
-            }
-        }
-        break :blk request.response.content_length;
-    };
+    var write_buffer: [4096]u8 = undefined;
+    var file_writer = file.writer(io, &write_buffer);
 
-    if (maybe_content_length) |content_length| {
-        try file.setEndPos(content_length);
-    }
+    // The http client takes care of validating the response body against the
+    // Content-Length/chunked framing while streaming it into the file.
+    const result = client.fetch(.{
+        .location = .{ .uri = uri },
+        .method = .GET,
+        .keep_alive = false,
+        .response_writer = &file_writer.interface,
+    }) catch |e| std.debug.panic(
+        "fetch '{f}': failed with {s}",
+        .{ uri, @errorName(e) },
+    );
+    if (result.status != .ok) return errExit(
+        "fetch '{f}': HTTP response {d} \"{?s}\"",
+        .{ uri, @intFromEnum(result.status), result.status.phrase() },
+    );
+    try file_writer.interface.flush();
 
-    var total_received: u64 = 0;
-    while (true) {
-        var buf: [@max(std.heap.page_size_min, 4096)]u8 = undefined;
-        const len = request.reader().read(&buf) catch |e| std.debug.panic(
-            "fetch '{}': read failed with {s}",
-            .{ uri, @errorName(e) },
-        );
-        if (len == 0) break;
-        total_received += len;
-
-        if (maybe_content_length) |content_length| {
-            if (total_received > content_length) errExit(
-                "fetch '{}': read more than Content-Length ({})",
-                .{ uri, content_length },
-            );
-        }
-        // NOTE: not going through a buffered writer since we're writing
-        //       large chunks
-        file.writer().writeAll(buf[0..len]) catch |err| std.debug.panic(
-            "fetch '{}': write {} bytes of HTTP response failed with {s}",
-            .{ uri, len, @errorName(err) },
-        );
-    }
-
-    if (maybe_content_length) |content_length| {
-        if (total_received != content_length) errExit(
-            "fetch '{}': Content-Length is {} but only read {}",
-            .{ uri, content_length, total_received },
-        );
-    }
-
-    try std.fs.cwd().rename(out_filepath_tmp, out_filepath);
+    try cwd.rename(out_filepath_tmp, cwd, out_filepath, io);
 }
 
 pub fn cmdFetch(
@@ -1131,26 +1127,28 @@ pub fn cmdFetch(
     },
 ) !zig.Package.Hash {
     const color: Color = .auto;
-    const work_around_btrfs_bug = native_os == .linux and
-        EnvVar.ZIG_BTRFS_WORKAROUND.isSet();
+    const io = global.io;
 
-    var thread_pool: ThreadPool = undefined;
-    try thread_pool.init(.{ .allocator = gpa });
-    defer thread_pool.deinit();
-
-    var http_client: std.http.Client = .{ .allocator = gpa };
+    var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
 
-    try http_client.initDefaultProxies(arena);
+    try http_client.initDefaultProxies(arena, global.environ_map);
 
     var job_queue: Package.Fetch.JobQueue = .{
+        .io = io,
         .http_client = &http_client,
-        .thread_pool = &thread_pool,
         .global_cache = global_cache_directory,
+        .local_cache = .{ .root_dir = global_cache_directory, .sub_path = "." },
+        // zig 0.16 unpacks packages into `root_pkg_path`; point it at the "p"
+        // subdirectory of the global cache so anyzig keeps its existing layout
+        // of `<global cache>/p/<hash>`, which `hashAndPath` and
+        // `listInstalled` both rely on.
+        .root_pkg_path = .{ .root_dir = global_cache_directory, .sub_path = "p" },
         .recursive = false,
         .read_only = false,
         .debug_hash = opt.debug_hash,
-        .work_around_btrfs_bug = work_around_btrfs_bug,
+        .mode = .needed,
+        .prog_node = global.getRootProgressNode(),
     };
     defer job_queue.deinit();
 
@@ -1158,7 +1156,7 @@ pub fn cmdFetch(
         .arena = std.heap.ArenaAllocator.init(gpa),
         .location = .{ .path_or_url = url },
         .location_tok = 0,
-        .hash_tok = 0,
+        .hash_tok = .none,
         .name_tok = 0,
         .lazy_status = .eager,
         .parent_package_root = undefined,
@@ -1167,14 +1165,13 @@ pub fn cmdFetch(
         .job_queue = &job_queue,
         .omit_missing_hash_error = true,
         .allow_missing_paths_field = false,
-        .allow_missing_fingerprint = true,
-        .allow_name_string = true,
         .use_latest_commit = true,
 
         .package_root = undefined,
         .error_bundle = undefined,
-        .manifest = null,
+        .manifest = undefined,
         .manifest_ast = undefined,
+        .have_manifest = false,
         .computed_hash = undefined,
         .has_build_zig = false,
         .oom_flag = false,
@@ -1187,12 +1184,15 @@ pub fn cmdFetch(
     log.info("downloading '{s}'...", .{url});
     fetch.run() catch |err| switch (err) {
         error.OutOfMemory => errExit("out of memory", .{}),
+        error.Canceled => |e| return e,
         error.FetchFailed => {}, // error bundle checked below
     };
 
+    try job_queue.group.await(io);
+
     if (fetch.error_bundle.root_list.items.len > 0) {
         var errors = try fetch.error_bundle.toOwnedBundle("");
-        errors.renderToStdErr(color.renderOptions());
+        try errors.renderToStderr(io, .{}, color);
         process.exit(1);
     }
 
@@ -1202,10 +1202,10 @@ pub fn cmdFetch(
 const BuildRoot = struct {
     directory: Cache.Directory,
     build_zig_basename: []const u8,
-    cleanup_build_dir: ?fs.Dir,
+    cleanup_build_dir: ?Dir,
 
-    fn deinit(br: *BuildRoot) void {
-        if (br.cleanup_build_dir) |*dir| dir.close();
+    fn deinit(br: *BuildRoot, io: Io) void {
+        if (br.cleanup_build_dir) |dir| dir.close(io);
         br.* = undefined;
     }
 };
@@ -1216,7 +1216,9 @@ const FindBuildRootOptions = struct {
 };
 
 fn findBuildRoot(arena: Allocator, options: FindBuildRootOptions) !?BuildRoot {
-    const cwd_path = options.cwd_path orelse try process.getCwdAlloc(arena);
+    const io = global.io;
+    const cwd: Dir = .cwd();
+    const cwd_path = options.cwd_path orelse try process.currentPathAlloc(io, arena);
     const build_zig_basename = if (options.build_file) |bf|
         fs.path.basename(bf)
     else
@@ -1224,7 +1226,7 @@ fn findBuildRoot(arena: Allocator, options: FindBuildRootOptions) !?BuildRoot {
 
     if (options.build_file) |bf| {
         if (fs.path.dirname(bf)) |dirname| {
-            const dir = fs.cwd().openDir(dirname, .{}) catch |err| {
+            const dir = cwd.openDir(io, dirname, .{}) catch |err| {
                 errExit("unable to open directory to build file from argument 'build-file', '{s}': {s}", .{ dirname, @errorName(err) });
             };
             return .{
@@ -1236,7 +1238,7 @@ fn findBuildRoot(arena: Allocator, options: FindBuildRootOptions) !?BuildRoot {
 
         return .{
             .build_zig_basename = build_zig_basename,
-            .directory = .{ .path = null, .handle = fs.cwd() },
+            .directory = .{ .path = null, .handle = cwd },
             .cleanup_build_dir = null,
         };
     }
@@ -1244,8 +1246,8 @@ fn findBuildRoot(arena: Allocator, options: FindBuildRootOptions) !?BuildRoot {
     var dirname: []const u8 = cwd_path;
     while (true) {
         const joined_path = try fs.path.join(arena, &[_][]const u8{ dirname, build_zig_basename });
-        if (fs.cwd().access(joined_path, .{})) |_| {
-            const dir = fs.cwd().openDir(dirname, .{ .iterate = true }) catch |err| {
+        if (cwd.access(io, joined_path, .{})) |_| {
+            const dir = cwd.openDir(io, dirname, .{ .iterate = true }) catch |err| {
                 errExit("unable to open directory while searching for build.zig file, '{s}': {s}", .{ dirname, @errorName(err) });
             };
 
@@ -1265,11 +1267,11 @@ fn findBuildRoot(arena: Allocator, options: FindBuildRootOptions) !?BuildRoot {
     }
 }
 
-fn caseMatches(iterable_dir: std.fs.Dir, name: []const u8) !bool {
+fn caseMatches(iterable_dir: Dir, name: []const u8) !bool {
     // TODO: maybe there is more efficient platform-specific mechanisms to implement this?
     var iterator = iterable_dir.iterate();
     var found_case_insensitive_match = false;
-    while (try iterator.next()) |entry| {
+    while (try iterator.next(global.io)) |entry| {
         if (std.mem.eql(u8, entry.name, name)) return true;
         found_case_insensitive_match = found_case_insensitive_match or std.ascii.eqlIgnoreCase(entry.name, name);
     }
