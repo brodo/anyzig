@@ -1,15 +1,18 @@
 //! Provides a platform abstraction for accessing cmdline args efficiently.
-//! Only allocates memory on Windows, uses std.os.argv on posix platforms.
+//! Only allocates memory on Windows, where the arguments have to be decoded
+//! from WTF-16; on other platforms the argument vector is used directly.
 const Cmdline = @This();
 
+args: std.process.Args,
 win32_slice: switch (builtin.os.tag) {
-    .windows => [][:0]u8,
+    .windows => []const [:0]const u8,
     else => void,
 },
 
-pub fn alloc(allocator: std.mem.Allocator) !Cmdline {
+pub fn alloc(args: std.process.Args, allocator: std.mem.Allocator) !Cmdline {
     return .{
-        .win32_slice = if (builtin.os.tag == .windows) try std.process.argsAlloc(allocator) else {},
+        .args = args,
+        .win32_slice = if (builtin.os.tag == .windows) try args.toSlice(allocator) else {},
     };
 }
 
@@ -22,13 +25,13 @@ pub fn free(self: Cmdline, allocator: std.mem.Allocator) void {
 pub fn len(self: Cmdline) usize {
     return switch (builtin.os.tag) {
         .windows => self.win32_slice.len,
-        else => std.os.argv.len,
+        else => self.args.vector.len,
     };
 }
-pub fn arg(self: Cmdline, i: usize) [:0]u8 {
+pub fn arg(self: Cmdline, i: usize) [:0]const u8 {
     return switch (builtin.os.tag) {
         .windows => self.win32_slice[i],
-        else => std.mem.span(std.os.argv[i]),
+        else => std.mem.span(self.args.vector[i]),
     };
 }
 
