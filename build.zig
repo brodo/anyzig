@@ -12,7 +12,7 @@ pub fn build(b: *std.Build) !void {
         "force-version",
         "Force a specific version, bypassing the automatic calendar version.",
     )) |v| verifyForceVersion(v) else null;
-    const release_version = if (version_option) |v| v else try makeCalVersion();
+    const release_version = if (version_option) |v| v else try makeCalVersion(b.graph.io);
     const dev_version = b.fmt("{s}-dev", .{if (version_option) |v| v else release_version});
     const write_files_version = b.addWriteFiles();
     const release_version_file = write_files_version.add("version-release", &release_version);
@@ -49,7 +49,7 @@ pub fn build(b: *std.Build) !void {
                     .{ .name = "zig", .module = zig_mod },
                     .{
                         .name = "version",
-                        .module = if (b.graph.env_map.get("HEW_BUILD_REVISION")) |r| b.createModule(.{
+                        .module = if (b.graph.environ_map.get("HEW_BUILD_REVISION")) |r| b.createModule(.{
                             .root_source_file = write_files_version.add("version-release-native", b.fmt("{s}-native", .{r})),
                         }) else dev_version_embed,
                     },
@@ -97,21 +97,12 @@ pub fn build(b: *std.Build) !void {
     const test_step = b.step("test", "");
     addTests(b, dev_version, anyzig, test_step, .{ .make_build_steps = true });
 
-    const zip_dep = b.dependency("zip", .{});
-
-    const host_zip_exe = b.addExecutable(.{
-        .name = "zip",
-        .root_source_file = zip_dep.path("src/zip.zig"),
-        .target = b.graph.host,
-        .optimize = .Debug,
-    });
-
     const ci_step = b.step("ci", "The build/test step to run on the CI");
     ci_step.dependOn(b.getInstallStep());
     ci_step.dependOn(test_step);
     ci_step.dependOn(&install_version_release_file.step);
 
-    try ci(b, &release_version, release_version_embed, zig_mod, ci_step, host_zip_exe);
+    try ci(b, &release_version, release_version_embed, zig_mod, ci_step);
 }
 
 fn verifyForceVersion(v: []const u8) [11]u8 {
@@ -144,8 +135,10 @@ fn verifyForceVersion(v: []const u8) [11]u8 {
     return result;
 }
 
-fn makeCalVersion() ![11]u8 {
-    const now = std.time.epoch.EpochSeconds{ .secs = @intCast(std.time.timestamp()) };
+fn makeCalVersion(io: std.Io) ![11]u8 {
+    const now = std.time.epoch.EpochSeconds{
+        .secs = @intCast(std.Io.Timestamp.now(io, .real).toSeconds()),
+    };
     const day = now.getEpochDay();
     const year_day = day.calculateYearDay();
     const month_day = year_day.calculateMonthDay();
@@ -225,8 +218,10 @@ fn addTests(
         .anyzig = anyzig,
         .wrap_exe = b.addExecutable(.{
             .name = "wrap",
-            .root_source_file = b.path("test/wrap.zig"),
-            .target = b.graph.host,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("test/wrap.zig"),
+                .target = b.graph.host,
+            }),
         }),
         .make_build_steps = opt.make_build_steps,
     };
@@ -620,7 +615,6 @@ fn ci(
     release_version_embed: *std.Build.Module,
     zig_mod: *std.Build.Module,
     ci_step: *std.Build.Step,
-    host_zip_exe: *std.Build.Step.Compile,
 ) !void {
     const ci_targets = [_][]const u8{
         "aarch64-linux",
@@ -703,9 +697,8 @@ fn ci(
                 b,
                 ci_target_str,
                 target.result,
-                target_dest_dir,
-                install_exes,
-                host_zip_exe,
+                zig_exe,
+                zls_exe,
             ));
         }
     }
@@ -715,53 +708,43 @@ fn makeCiArchiveStep(
     b: *std.Build,
     ci_target_str: []const u8,
     target: std.Target,
-    target_install_dir: std.Build.InstallDir,
-    install_exes: *std.Build.Step,
-    host_zip_exe: *std.Build.Step.Compile,
+    zig_exe: *std.Build.Step.Compile,
+    zls_exe: *std.Build.Step.Compile,
 ) *std.Build.Step {
-    const install_path = b.getInstallPath(.prefix, ".");
+    // `addOutputFileArg` and the file/directory args make these Run steps
+    // cacheable: the archive is only rebuilt when an input binary changes.
+    switch (target.os.tag) {
+        .windows => {
+            const archive_name = b.fmt("anyzig-{s}.zip", .{ci_target_str});
+            // -j stores the files under their basename, without any directory.
+            const zip = b.addSystemCommand(&.{ "zip", "-9", "-q", "-j" });
+            const archive = zip.addOutputFileArg(archive_name);
+            zip.addFileArg(zig_exe.getEmittedBin());
+            zip.addFileArg(zig_exe.getEmittedPdb());
+            zip.addFileArg(zls_exe.getEmittedBin());
+            zip.addFileArg(zls_exe.getEmittedPdb());
+            return &b.addInstallFileWithDir(archive, .prefix, archive_name).step;
+        },
+        else => {
+            const archive_name = b.fmt("anyzig-{s}.tar.gz", .{ci_target_str});
+            // Each executable lives in its own cache directory, and tar
+            // resolves every -C relative to the previous one, so gather them
+            // into a single directory and change into it just once.
+            const dir = b.addWriteFiles();
+            _ = dir.addCopyFile(zig_exe.getEmittedBin(), "zig");
+            _ = dir.addCopyFile(zls_exe.getEmittedBin(), "zls");
 
-    // not sure yet if we want to include zls.exe in our archives?
-    const include_zls = false;
-
-    if (target.os.tag == .windows) {
-        const out_zip_file = b.pathJoin(&.{
-            install_path,
-            b.fmt("anyzig-{s}.zip", .{ci_target_str}),
-        });
-        const zip = b.addRunArtifact(host_zip_exe);
-        zip.addArg(out_zip_file);
-        zip.addArg("zig.exe");
-        zip.addArg("zig.pdb");
-        if (include_zls) {
-            zip.addArg("zls.exe");
-            zip.addArg("zls.pdb");
-        }
-        zip.cwd = .{ .cwd_relative = b.getInstallPath(
-            target_install_dir,
-            ".",
-        ) };
-        zip.step.dependOn(install_exes);
-        return &zip.step;
+            const tar = b.addSystemCommand(&.{ "tar", "-czf" });
+            // macOS tar otherwise stores extended attributes as AppleDouble
+            // "._name" members, which show up as junk files when the archive is
+            // extracted elsewhere. GNU tar ignores this variable.
+            tar.setEnvironmentVariable("COPYFILE_DISABLE", "1");
+            const archive = tar.addOutputFileArg(archive_name);
+            tar.addArg("-C");
+            tar.addDirectoryArg(dir.getDirectory());
+            tar.addArg("zig");
+            tar.addArg("zls");
+            return &b.addInstallFileWithDir(archive, .prefix, archive_name).step;
+        },
     }
-
-    const targz = b.pathJoin(&.{
-        install_path,
-        b.fmt("anyzig-{s}.tar.gz", .{ci_target_str}),
-    });
-    const tar = b.addSystemCommand(&.{
-        "tar",
-        "-czf",
-        targz,
-        "zig",
-    });
-    if (include_zls) {
-        tar.addArg("zls");
-    }
-    tar.cwd = .{ .cwd_relative = b.getInstallPath(
-        target_install_dir,
-        ".",
-    ) };
-    tar.step.dependOn(install_exes);
-    return &tar.step;
 }
