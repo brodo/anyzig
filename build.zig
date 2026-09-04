@@ -393,6 +393,10 @@ fn addTests(
                     .@"0.7.0" => false, // crashes for some reason?
                     .@"0.9.0", .@"0.9.1" => false, // panics
                     .@"0.10.0", .@"0.10.1" => false, // error(link): undefined reference to symbol 'dyld_stub_binder'
+                    // cannot link against the macOS 26 SDK (see
+                    // `bundled_darwin_libc`), and aborts with DarwinSdkNotFound
+                    // instead of falling back to its bundled libSystem.tbd
+                    .@"0.11.0" => false,
                     else => true,
                 },
                 else => true,
@@ -414,6 +418,10 @@ fn addTests(
                 .input_dir = .{ .path = init_out },
                 .options = .nosetup,
                 .args = &.{"build"},
+                .bundled_darwin_libc = switch (zig_release) {
+                    .@"0.12.0", .@"0.12.1", .@"0.13.0", .@"0.14.0", .@"0.14.1" => true,
+                    else => false,
+                },
             });
         }
     }
@@ -504,6 +512,7 @@ fn addTests(
                 .input_dir = .{ .path = write_files.getDirectory().path(b, "example-0.12.0") },
                 .options = .nosetup,
                 .args = &.{"build"},
+                .bundled_darwin_libc = true,
             });
             t.run.expectStdOutEqual("0.12.0\n");
         }
@@ -513,6 +522,7 @@ fn addTests(
                 .input_dir = .{ .path = write_files.getDirectory().path(b, "example-0.13.0") },
                 .options = .nosetup,
                 .args = &.{"build"},
+                .bundled_darwin_libc = true,
             });
             t.run.expectStdOutEqual("0.13.0\n");
         }
@@ -522,6 +532,7 @@ fn addTests(
                 .input_dir = .{ .path = write_files.getDirectory().path(b, "example-0.13.0") },
                 .options = .nosetup,
                 .args = &.{ "build", "--build-file" },
+                .bundled_darwin_libc = true,
             });
             t.run.addFileArg(build_zig_12);
             t.run.expectStdOutEqual("0.12.0\n");
@@ -532,6 +543,7 @@ fn addTests(
                 .input_dir = .{ .path = write_files.getDirectory().path(b, "example-0.12.0") },
                 .options = .nosetup,
                 .args = &.{ "build", "--build-file" },
+                .bundled_darwin_libc = true,
             });
             t.run.addFileArg(build_zig_13);
             t.run.expectStdOutEqual("0.13.0\n");
@@ -559,10 +571,24 @@ const TestFactory = struct {
         },
         options: enum { nosetup, badhash },
         args: []const []const u8,
+        /// Zig versions older than 0.16 look up "arm64-macos" in the SDK's
+        /// libSystem.tbd, but SDKs > 26.4 only ship "arm64e-macos".
+        /// This breaks linking. In order wo work around this, we set
+        /// `DEVELOPER_DIR` to a non-existent dir. This triggers Zigs
+        /// fall back mechanism and lets it build with it's own
+        /// libSystem.tbd.
+        ///
+        /// 0.11 and older abort instead of falling back, so these won't
+        /// build on new macOS versions regardless of which env variables
+        /// are set.
+        bundled_darwin_libc: bool = false,
     }) TestAnyzig {
         const b = self.b;
         const run = b.addRunArtifact(self.wrap_exe);
         run.setName(args.name);
+        if (args.bundled_darwin_libc and b.graph.host.result.os.tag == .macos) {
+            run.setEnvironmentVariable("DEVELOPER_DIR", "/nonexistent");
+        }
         switch (args.input_dir) {
             .no_input => run.addArg("--no-input"),
             .path => |p| run.addDirectoryArg(p),
