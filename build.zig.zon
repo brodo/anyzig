@@ -2,12 +2,12 @@
     .name = .anyzig,
     .version = "0.0.0",
     .fingerprint = 0x7cd092f5bd0fed33, // Changing this has security and trust implications.
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0-dev.2033+af24fd11a",
     .dependencies = .{
         .zig = .{
             // depend on a release version that will survide forge hosting changes
-            .url = "https://ziglang.org/download/0.16.0/zig-0.16.0.tar.xz",
-            .hash = "zig-0.0.0-Fp4XJEmc5A0tH6Thh10e99XRWJVD9zDojxbQNedFbtC0",
+            .url = "https://ziglang.org/builds/zig-0.17.0-dev.2033+af24fd11a.tar.xz",
+            .hash = "zig-0.0.0-Fp4XJMRdPw6_ntZ-nfIaj9mIECMpdnLAgT1_EAc6u6Ha",
         },
     },
     .paths = .{

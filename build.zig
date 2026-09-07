@@ -1,11 +1,12 @@
 const builtin = @import("builtin");
 const std = @import("std");
 const zig = @import("zig");
+const build_zon = @import("build.zig.zon");
 
 const Exe = enum { zig, zls };
 
 pub fn build(b: *std.Build) !void {
-    const zig_dep = b.dependency("zig", .{});
+    const zig_dep = b.dependency("zig", .{.@"version-string" = build_zon.minimum_zig_version});
 
     const version_option: ?[11]u8 = if (b.option(
         []const u8,
@@ -26,7 +27,7 @@ pub fn build(b: *std.Build) !void {
 
     const write = b.addWriteFiles();
     _ = write.addCopyDirectory(zig_dep.path("."), "", .{});
-    const root = write.addCopyFile(b.path("zigroot/root.zig"), "src/root.zig");
+    const root = write.addCopyFile(b.path("zigroot/root.zig"), "lib/compiler/root.zig");
     const zig_mod = b.createModule(.{
         .root_source_file = root,
     });
@@ -62,9 +63,7 @@ pub fn build(b: *std.Build) !void {
 
         const run = b.addRunArtifact(exe);
         run.step.dependOn(&install.step);
-        if (b.args) |args| {
-            run.addArgs(args);
-        }
+        run.addPassthruArgs();
         b.step("run", "").dependOn(&run.step);
         break :blk exe;
     };
@@ -88,9 +87,7 @@ pub fn build(b: *std.Build) !void {
 
         const run = b.addRunArtifact(exe);
         run.step.dependOn(&install.step);
-        if (b.args) |args| {
-            run.addArgs(args);
-        }
+        run.addPassthruArgs();
         b.step("zls", "").dependOn(&run.step);
     }
 
@@ -306,15 +303,12 @@ fn addTests(
         .args = &.{ "master", "init" },
     });
 
-    inline for (std.meta.fields(ZigRelease)) |field| {
-        const zig_version = field.name;
-        const zig_release: ZigRelease = @enumFromInt(field.value);
-
+    for (std.meta.tags(ZigRelease)) |zig_release| {
         if (zig_release == .@"2024.11.0-mach") continue; // TODO: re-enable when pkg.hexops.org is back online
 
         switch (builtin.os.tag) {
             .linux => switch (builtin.cpu.arch) {
-                .x86_64 => switch (comptime zig_release) {
+                .x86_64 => switch (zig_release) {
                     // fails to get dynamic linker on NixOS
                     .@"0.7.0",
                     .@"0.7.1",
@@ -328,14 +322,14 @@ fn addTests(
                 else => {},
             },
             .macos => switch (builtin.cpu.arch) {
-                .aarch64 => switch (comptime zig_release) {
+                .aarch64 => switch (zig_release) {
                     .@"0.7.1" => continue, // HTTP download fails with "404 Not Found"
                     else => {},
                 },
                 else => {},
             },
             .windows => switch (builtin.cpu.arch) {
-                .aarch64 => switch (comptime zig_release) {
+                .aarch64 => switch (zig_release) {
                     // no windows-aarch64 downloads before 0.9.0
                     .@"0.7.0",
                     .@"0.7.1",
@@ -348,7 +342,7 @@ fn addTests(
             },
             else => {},
         }
-
+        const zig_version = @tagName(zig_release);
         const init_out = test_factory.add(.{
             .name = b.fmt("test-{s}-init", .{zig_version}),
             .input_dir = .no_input,
@@ -369,7 +363,7 @@ fn addTests(
                 .options = .nosetup,
                 .args = &.{"version"},
             });
-            t.run.expectStdOutEqual(comptime zig_release.getVersionOutput() ++ "\n");
+            t.run.expectStdOutEqual(b.fmt("{s}\n", .{zig_release.getVersionOutput()}));
         }
 
         for ([_][]const u8{ "-h", "--help" }) |help_flag| {

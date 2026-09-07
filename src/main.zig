@@ -16,7 +16,6 @@ const EnvVar = std.zig.EnvVar;
 const zig = @import("zig");
 
 const Package = zig.Package;
-const introspect = zig.introspect;
 
 pub const log = std.log;
 
@@ -441,7 +440,7 @@ pub fn main(init: std.process.Init) !void {
     const override_global_cache_dir: ?[]const u8 = EnvVar.ZIG_GLOBAL_CACHE_DIR.get(global.environ_map);
     var global_cache_directory: Directory = l: {
         const p = override_global_cache_dir orelse
-            try introspect.resolveGlobalCacheDir(arena, global.environ_map);
+            try std.zig.resolveGlobalCacheDir(arena, global.environ_map);
         break :l .{
             .handle = try Dir.cwd().createDirPathOpen(io, p, .{}),
             .path = p,
@@ -642,7 +641,7 @@ fn listInstalled() !void {
 
     const override_global_cache_dir: ?[]const u8 = EnvVar.ZIG_GLOBAL_CACHE_DIR.get(global.environ_map);
     const global_cache_dir_path = override_global_cache_dir orelse
-        try introspect.resolveGlobalCacheDir(global.arena, global.environ_map);
+        try std.zig.resolveGlobalCacheDir(global.arena, global.environ_map);
     const p_path = std.fs.path.join(global.arena, &.{ global_cache_dir_path, "p" }) catch |e| oom(e);
     defer global.arena.free(p_path);
 
@@ -1134,16 +1133,21 @@ pub fn cmdFetch(
 
     try http_client.initDefaultProxies(arena, global.environ_map);
 
+    const local_storage: Package.Fetch.LocalStorage = .{
+        .cache_root = .{ .root_dir = global_cache_directory },
+        .pkg_root = .{ .root_dir = global_cache_directory, .sub_path = "p" },
+    };
+
+
     var job_queue: Package.Fetch.JobQueue = .{
         .io = io,
         .http_client = &http_client,
         .global_cache = global_cache_directory,
-        .local_cache = .{ .root_dir = global_cache_directory, .sub_path = "." },
+        .local_storage = &local_storage,
         // zig 0.16 unpacks packages into `root_pkg_path`; point it at the "p"
         // subdirectory of the global cache so anyzig keeps its existing layout
         // of `<global cache>/p/<hash>`, which `hashAndPath` and
         // `listInstalled` both rely on.
-        .root_pkg_path = .{ .root_dir = global_cache_directory, .sub_path = "p" },
         .recursive = false,
         .read_only = false,
         .debug_hash = opt.debug_hash,
@@ -1176,8 +1180,8 @@ pub fn cmdFetch(
         .has_build_zig = false,
         .oom_flag = false,
         .latest_commit = null,
-
-        .module = null,
+        .remote_package_root = undefined,
+        .cli_module = null,
     };
     defer fetch.deinit();
 
@@ -1222,7 +1226,7 @@ fn findBuildRoot(arena: Allocator, options: FindBuildRootOptions) !?BuildRoot {
     const build_zig_basename = if (options.build_file) |bf|
         fs.path.basename(bf)
     else
-        Package.build_zig_basename;
+        std.zig.build_zig_basename;
 
     if (options.build_file) |bf| {
         if (fs.path.dirname(bf)) |dirname| {
